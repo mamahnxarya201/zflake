@@ -1,5 +1,4 @@
 const std = @import("std");
-const builtin = @import("builtin");
 
 // let the user handle the error themselves?
 // i see the stdlib does this so might just follow it
@@ -73,6 +72,20 @@ pub const Snowflake = struct {
             (self.dataCenterId << (self.sequenceBits + self.workerIdBits)) |
             (self.workerId << self.sequenceBits) |
             sequence;
+    }
+
+    pub fn decode(self: Snowflake, id: i64) struct {
+        timestamp: i64,
+        dataCenterId: u32,
+        workerId: u32,
+        sequence: u32,
+    } {
+        return .{
+            .timestamp = (id >> self.timestampLeftShift) + self.epoch,
+            .dataCenterId = @as(u32, @intCast((id >> (self.workerIdBits + self.sequenceBits)) & self.maxDataCenterId)),
+            .workerId = @as(u32, @intCast((id >> self.sequenceBits) & self.maxWorkerId)),
+            .sequence = @as(u32, @intCast(id & self.sequenceMask)),
+        };
     }
 };
 
