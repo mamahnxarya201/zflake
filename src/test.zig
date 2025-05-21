@@ -291,5 +291,3 @@ test "memory leak detection" {
     const leaked = gpa.deinit() == .leak;
     try expect(!leaked);
 }
-
-// We've replaced the problematic tests with better implementations above
