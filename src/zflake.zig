@@ -1,6 +1,8 @@
 const std = @import("std");
+const Mutex = std.Thread.Mutex;
+const Allocator = std.mem.Allocator;
 
-pub const SnowflakeError = error{ ClockMovedBackwards, InvalidDataCenterId, InvalidWorkerId };
+pub const SnowflakeError = error{ ClockMovedBackwards, InvalidDataCenterId, InvalidWorkerId, OutOfMemory };
 
 /// ID components returned by decode
 pub const IdComponents = struct {
@@ -8,7 +10,17 @@ pub const IdComponents = struct {
     dataCenterId: u32,
     workerId: u32,
     sequence: u32,
+    
+    pub fn eql(self: IdComponents, other: IdComponents) bool {
+        return self.timestamp == other.timestamp and
+               self.dataCenterId == other.dataCenterId and
+               self.workerId == other.workerId and
+               self.sequence == other.sequence;
+    }
 };
+
+/// Cache map for memoizing decoded IDs
+const DecodeCacheMap = std.AutoHashMap(i64, IdComponents);
 
 /// The internal state of a Snowflake generator - implementation detail
 const State = struct {
@@ -34,9 +46,15 @@ const State = struct {
 /// A handle to a Snowflake ID generator with its own internal state
 pub const Generator = struct {
     state: State,
+    mutex: Mutex = .{},  // Mutex for thread-safe operations
+    cache: ?*DecodeCacheMap = null, // Optional memoization cache
+    allocator: ?Allocator = null,   // Allocator for cache memory management
     
-    /// Generate a new unique Snowflake ID
+    /// Generate a new unique Snowflake ID with thread safety
     pub fn generate(self: *Generator) !i64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        
         var timestamp = std.time.milliTimestamp();
 
         if (timestamp < self.state.lastTimestamp) {
@@ -64,13 +82,55 @@ pub const Generator = struct {
     }
 
     /// Decode a Snowflake ID back into its component parts
+    /// Uses memoization if cache is enabled
     pub fn decode(self: Generator, id: i64) IdComponents {
-        return .{
+        // Try to get from cache if available
+        if (self.cache) |cache| {
+            if (cache.get(id)) |components| {
+                return components; // No dereference needed, it's a value not a pointer
+            }
+        }
+        
+        // Calculate components
+        const components = IdComponents{
             .timestamp = (id >> self.state.timestampLeftShift) + self.state.epoch,
             .dataCenterId = @as(u32, @intCast((id >> (self.state.workerIdBits + self.state.sequenceBits)) & self.state.maxDataCenterId)),
             .workerId = @as(u32, @intCast((id >> self.state.sequenceBits) & self.state.maxWorkerId)),
             .sequence = @as(u32, @intCast(id & self.state.sequenceMask)),
         };
+        
+        // Store in cache if available
+        if (self.cache != null) {
+            const cache = self.cache.?;
+            
+            // Attempt to add to cache, ignore errors (e.g. if already exists)
+            _ = cache.put(id, components) catch {};
+        }
+        
+        return components;
+    }
+    
+    /// Initialize memoization cache for frequently-used IDs
+    pub fn initMemoization(self: *Generator, allocator: Allocator) !void {
+        if (self.cache != null) return;
+        
+        const cache = try allocator.create(DecodeCacheMap);
+        cache.* = DecodeCacheMap.init(allocator);
+        self.cache = cache;
+        self.allocator = allocator;
+    }
+    
+    /// Deinitialize and free resources
+    pub fn deinit(self: *Generator) void {
+        if (self.cache != null and self.allocator != null) {
+            const cache = self.cache.?;
+            const alloc = self.allocator.?;
+            
+            cache.deinit(); // HashMap.deinit doesn't take an allocator parameter
+            alloc.destroy(cache);
+            self.cache = null;
+            self.allocator = null;
+        }
     }
 };
 

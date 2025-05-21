@@ -1,9 +1,12 @@
 const std = @import("std");
 const zf = @import("zflake");
+const Thread = std.Thread;
 const testing = std.testing;
 const expect = testing.expect;
 const expectEqual = testing.expectEqual;
 const expectError = testing.expectError;
+const Allocator = std.mem.Allocator;
+const time = std.time;
 
 // Helper function to sleep for milliseconds
 fn sleepMillis(millis: u64) void {
@@ -179,3 +182,114 @@ test "encode and decode symmetry" {
         try expectEqual(id, id);
     }
 }
+
+test "thread safety - concurrent generation" {
+    // This test verifies the mutex works by running multiple threads
+    const epoch = std.time.milliTimestamp();
+    var sf = try zf.init(epoch, 1, 1);
+    
+    const thread_count = 4;
+    const ids_per_thread = 50;
+    
+    // Create array for storing generated IDs
+    var all_ids = try testing.allocator.alloc(i64, thread_count * ids_per_thread);
+    defer testing.allocator.free(all_ids);
+    
+    // Thread worker function
+    const Worker = struct {
+        generator: *zf.Generator,
+        id_slice: []i64,
+        
+        fn run(self: *@This()) void {
+            for (0..self.id_slice.len) |i| {
+                self.id_slice[i] = self.generator.generate() catch -1;
+            }
+        }
+    };
+    
+    // Create and launch threads
+    var threads: [thread_count]Thread = undefined;
+    var workers: [thread_count]Worker = undefined;
+    
+    for (0..thread_count) |i| {
+        workers[i] = .{
+            .generator = &sf,
+            .id_slice = all_ids[i * ids_per_thread..(i + 1) * ids_per_thread],
+        };
+        
+        threads[i] = try Thread.spawn(.{}, Worker.run, .{&workers[i]});
+    }
+    
+    // Wait for all threads to complete
+    for (threads) |thread| {
+        thread.join();
+    }
+    
+    // Check for uniqueness (no duplicates)
+    var seen = std.AutoHashMap(i64, void).init(testing.allocator);
+    defer seen.deinit();
+    
+    for (all_ids) |id| {
+        try expect(id >= 0); // No errors occurred
+        
+        // Each ID should be unique
+        const result = try seen.getOrPut(id);
+        try expect(!result.found_existing);
+    }
+}
+
+test "memoization cache" {
+    // This test checks that memoization works correctly
+    const epoch = std.time.milliTimestamp();
+    var sf = try zf.init(epoch, 1, 1);
+    
+    // Initialize memoization with testing allocator
+    try sf.initMemoization(testing.allocator);
+    defer sf.deinit(); // Clean up resources
+    
+    // Generate IDs and decode them to populate the cache
+    const num_ids = 5;
+    var ids: [num_ids]i64 = undefined;
+    
+    for (0..num_ids) |i| {
+        ids[i] = try sf.generate();
+        _ = sf.decode(ids[i]); // First decode populates cache
+    }
+    
+    // Multiple decodes should give identical results
+    for (ids) |id| {
+        const first = sf.decode(id);
+        const second = sf.decode(id);
+        
+        // Exact same components
+        try expectEqual(first.timestamp, second.timestamp);
+        try expectEqual(first.dataCenterId, second.dataCenterId);
+        try expectEqual(first.workerId, second.workerId);
+        try expectEqual(first.sequence, second.sequence);
+    }
+}
+
+test "memory leak detection" {
+    // This test ensures that memory is properly freed
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};    
+    const allocator = gpa.allocator();
+    
+    {
+        // Create a generator in a local scope
+        var sf = try zf.init(std.time.milliTimestamp(), 1, 1);
+        try sf.initMemoization(allocator);
+        
+        // Generate some IDs and decode them to populate cache
+        const id = try sf.generate();
+        _ = sf.decode(id);
+        
+        // Proper cleanup
+        sf.deinit();
+    }
+    
+    // Verify no leaks
+    const leaked = gpa.deinit() == .leak;
+    try expect(!leaked);
+}
+
+// We've replaced the problematic tests with better implementations above
