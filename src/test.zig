@@ -13,7 +13,7 @@ fn sleepMillis(millis: u64) void {
 test "basic generation encode decode" {
     const epoch = std.time.milliTimestamp();
     var sf = try zf.Snowflake.init(epoch, 1, 1);
-    const id = try sf.generate();
+    const id = try sf.generate(); // Note: sf is now passed as pointer implicitly
     const decoded = sf.decode(id);
     
     try expect(decoded.timestamp >= epoch);

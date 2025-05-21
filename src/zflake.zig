@@ -1,79 +1,98 @@
 const std = @import("std");
 
-// let the user handle the error themselves?
-// i see the stdlib does this so might just follow it
-// example on this stdlib will be: OpenError in std.fs
 pub const SnowflakeError = error{ ClockMovedBackwards, InvalidDataCenterId, InvalidWorkerId };
 
+/// Snowflake ID generator based on Twitter's snowflake format
+/// Generates unique 64-bit IDs with embedded timestamp, worker ID, and sequence information
 pub const Snowflake = struct {
-    // TODO: research memory usage about using 64 everywhere
-    // i am afraid of stackoverflow so lets just use 64 everywhere since
-    // the scala implementation use long to handle of all operation
+    // Core configuration values
     epoch: i64,
-    dataCenterId: i64,
-    workerId: i64,
-
-    // Default snowflake bit is 22
-    // Make this field configurable from init
+    dataCenterId: u32,
+    workerId: u32,
+    
+    // Bit allocation (configurable)
     dataCenterIdBits: u6 = 5,
     workerIdBits: u6 = 5,
     sequenceBits: u6 = 12,
+    
+    // Computed fields from bit allocation
+    sequenceMask: i64,
+    maxDataCenterId: i64,
+    maxWorkerId: i64, 
+    timestampLeftShift: u6,
+    
+    // Internal state - now instance variables for thread safety
+    lastTimestamp: i64 = 0,
+    sequence: i64 = 0,
 
-    // I dont know why but i dont like this
-    // Feels like oop but i guess it fine for now
-    // TODO: Refactor it later
-    sequenceMask: i64 = 0,
-    maxDataCenterId: i64 = 0,
-    maxWorkerId: i64 = 0,
-    timestampLeftShift: u6 = 0,
-
-    var lastTimestamp: i64 = 0;
-    var sequence: i64 = 0;
-
-    pub fn init(epoch: i64, dataCenterId: i64, workerId: i64) !Snowflake {
+    /// Initialize a new Snowflake ID generator
+    /// epoch: Custom epoch start time in milliseconds
+    /// dataCenterId: ID of the datacenter (must be within range for dataCenterIdBits)
+    /// workerId: ID of the worker (must be within range for workerIdBits)
+    pub fn init(epoch: i64, dataCenterId: u32, workerId: u32) !Snowflake {
         var self = Snowflake{
             .epoch = epoch,
             .dataCenterId = dataCenterId,
             .workerId = workerId,
+            .sequenceMask = 0,
+            .maxDataCenterId = 0,
+            .maxWorkerId = 0,
+            .timestampLeftShift = 0,
         };
 
+        // Calculate bit masks and shifts
         self.sequenceMask = ~@as(i64, 0) ^ (~@as(i64, 0) << self.sequenceBits);
         self.maxDataCenterId = ~@as(i64, 0) ^ (~@as(i64, 0) << self.dataCenterIdBits);
-        self.maxWorkerId = ~@as(i64, 0) ^ (~@as(i64, 0) << self.dataCenterIdBits);
+        self.maxWorkerId = ~@as(i64, 0) ^ (~@as(i64, 0) << self.workerIdBits); // Fixed: was using dataCenterIdBits
         self.timestampLeftShift = self.sequenceBits + self.workerIdBits + self.dataCenterIdBits;
 
-        if (self.dataCenterId > self.maxDataCenterId) {
+        // Validate configuration
+        if (self.dataCenterId > @as(u32, @intCast(self.maxDataCenterId))) {
             return SnowflakeError.InvalidDataCenterId;
         }
 
-        if (self.workerId > self.maxWorkerId) {
+        if (self.workerId > @as(u32, @intCast(self.maxWorkerId))) {
             return SnowflakeError.InvalidWorkerId;
         }
 
         return self;
     }
 
-    pub fn generate(self: Snowflake) !i64 {
+    /// Generate a new unique Snowflake ID
+    /// Returns a 64-bit ID or an error if clock moved backwards
+    pub fn generate(self: *Snowflake) !i64 {
         var timestamp = std.time.milliTimestamp();
 
-        if (timestamp < lastTimestamp) {
-            std.debug.print("what the fuck ?", .{});
+        if (timestamp < self.lastTimestamp) {
+            return SnowflakeError.ClockMovedBackwards;
         }
 
-        if (lastTimestamp == timestamp) {
-            sequence = (sequence + 1) & self.sequenceMask;
-            if (sequence == 0) {
-                timestamp = try waitTillNextMilis(lastTimestamp);
+        if (self.lastTimestamp == timestamp) {
+            // Same millisecond: increment sequence
+            self.sequence = (self.sequence + 1) & self.sequenceMask;
+            if (self.sequence == 0) {
+                // Sequence exhausted, wait till next millisecond
+                timestamp = try waitTillNextMilis(self.lastTimestamp);
             }
+        } else {
+            // Different millisecond: reset sequence
+            self.sequence = 0;
         }
 
-        lastTimestamp = timestamp;
+        self.lastTimestamp = timestamp;
+        
+        // Construct ID from components:
+        // - timestamp in most significant bits
+        // - followed by datacenter ID
+        // - followed by worker ID
+        // - sequence in least significant bits
         return ((timestamp - self.epoch) << self.timestampLeftShift) |
-            (self.dataCenterId << (self.sequenceBits + self.workerIdBits)) |
-            (self.workerId << self.sequenceBits) |
-            sequence;
+            (@as(i64, self.dataCenterId) << (self.sequenceBits + self.workerIdBits)) |
+            (@as(i64, self.workerId) << self.sequenceBits) |
+            self.sequence;
     }
 
+    /// Decode a Snowflake ID back into its component parts
     pub fn decode(self: Snowflake, id: i64) struct {
         timestamp: i64,
         dataCenterId: u32,
@@ -89,9 +108,10 @@ pub const Snowflake = struct {
     }
 };
 
-fn waitTillNextMilis(lastTimestamp: i64) !i64 {
+/// Helper function to wait until the next millisecond
+fn waitTillNextMilis(last_timestamp: i64) !i64 {
     var timestamp = std.time.milliTimestamp();
-    while (timestamp <= lastTimestamp) {
+    while (timestamp <= last_timestamp) {
         timestamp = std.time.milliTimestamp();
     }
     return timestamp;
