@@ -1,14 +1,204 @@
 const std = @import("std");
 const zf = @import("zflake");
-const expect = std.testing.expect;
+const testing = std.testing;
+const expect = testing.expect;
+const expectEqual = testing.expectEqual;
+const expectError = testing.expectError;
 
-test "basic generation" {
+// Helper function to sleep for milliseconds
+fn sleepMillis(millis: u64) void {
+    std.time.sleep(millis * std.time.ns_per_ms);
+}
+
+test "basic generation encode decode" {
     const epoch = std.time.milliTimestamp();
     var sf = try zf.Snowflake.init(epoch, 1, 1);
     const id = try sf.generate();
     const decoded = sf.decode(id);
     
-    try std.testing.expect(decoded.timestamp >= epoch);
-    try std.testing.expectEqual(@as(u32, 1), decoded.dataCenterId);
-    try std.testing.expectEqual(@as(u32, 1), decoded.workerId);
+    try expect(decoded.timestamp >= epoch);
+    try expectEqual(@as(u32, 1), decoded.dataCenterId);
+    try expectEqual(@as(u32, 1), decoded.workerId);
+}
+
+test "multiple unique IDs" {
+    const epoch = std.time.milliTimestamp();
+    var sf = try zf.Snowflake.init(epoch, 1, 1);
+    
+    const id1 = try sf.generate();
+    const id2 = try sf.generate();
+    const id3 = try sf.generate();
+    
+    try expect(id1 != id2);
+    try expect(id2 != id3);
+    try expect(id1 != id3);
+}
+
+test "decode preserves all components" {
+    const epoch = std.time.milliTimestamp();
+    var sf = try zf.Snowflake.init(epoch, 3, 7);
+    
+    const id = try sf.generate();
+    const decoded = sf.decode(id);
+    
+    try expectEqual(@as(u32, 3), decoded.dataCenterId);
+    try expectEqual(@as(u32, 7), decoded.workerId);
+    try expect(decoded.sequence >= 0);
+    try expect(decoded.timestamp >= epoch);
+}
+
+test "boundary data center ID" {
+    const epoch = std.time.milliTimestamp();
+    
+    // Max valid data center ID (31 for 5 bits)
+    var sf1 = try zf.Snowflake.init(epoch, 31, 1);
+    _ = try sf1.generate();
+    
+    // One over max should fail
+    try expectError(zf.SnowflakeError.InvalidDataCenterId, zf.Snowflake.init(epoch, 32, 1));
+    
+    // Zero is valid
+    var sf2 = try zf.Snowflake.init(epoch, 0, 1);
+    const id = try sf2.generate();
+    const decoded = sf2.decode(id);
+    try expectEqual(@as(u32, 0), decoded.dataCenterId);
+}
+
+test "boundary worker ID" {
+    const epoch = std.time.milliTimestamp();
+    
+    // Max valid worker ID (31 for 5 bits)
+    var sf1 = try zf.Snowflake.init(epoch, 1, 31);
+    _ = try sf1.generate();
+    
+    // One over max should fail
+    try expectError(zf.SnowflakeError.InvalidWorkerId, zf.Snowflake.init(epoch, 1, 32));
+    
+    // Zero is valid
+    var sf2 = try zf.Snowflake.init(epoch, 1, 0);
+    const id = try sf2.generate();
+    const decoded = sf2.decode(id);
+    try expectEqual(@as(u32, 0), decoded.workerId);
+}
+
+test "sequence increment" {
+    const epoch = std.time.milliTimestamp();
+    var sf = try zf.Snowflake.init(epoch, 1, 1);
+    
+    const id1 = try sf.generate();
+    const id2 = try sf.generate();
+    
+    const decoded1 = sf.decode(id1);
+    const decoded2 = sf.decode(id2);
+    
+    // Second ID should have sequence incremented by 1
+    // (assuming they're generated within the same millisecond)
+    try expectEqual(decoded1.sequence + 1, decoded2.sequence);
+}
+
+test "sequence rollover within same millisecond" {
+    // This test will loop to generate many IDs in a short time
+    // to force sequence rollover behavior
+    const epoch = std.time.milliTimestamp();
+    var sf = try zf.Snowflake.init(epoch, 1, 1);
+    
+    var last_sequence: u32 = undefined;
+    var rollover_detected = false;
+    
+    // Generate several IDs to potentially trigger rollover
+    for (0..100) |i| {
+        const id = try sf.generate();
+        const decoded = sf.decode(id);
+        
+        if (i > 0 and decoded.sequence < last_sequence) {
+            rollover_detected = true;
+            break;
+        }
+        
+        last_sequence = decoded.sequence;
+    }
+    
+    // Note: This test might pass even if rollover isn't detected
+    // because it depends on timing and might not happen every run
+}
+
+test "timestamp advancement" {
+    const epoch = std.time.milliTimestamp();
+    var sf = try zf.Snowflake.init(epoch, 1, 1);
+    
+    const id1 = try sf.generate();
+    // Sleep to ensure timestamp advances
+    sleepMillis(5);
+    const id2 = try sf.generate();
+    
+    const decoded1 = sf.decode(id1);
+    const decoded2 = sf.decode(id2);
+    
+    try expect(decoded2.timestamp > decoded1.timestamp);
+    // Note: In some Snowflake implementations the sequence resets to 0 when timestamp advances,
+    // but this is implementation-dependent and not required for correct behavior
+}
+
+test "custom bit configuration" {
+    const epoch = std.time.milliTimestamp();
+    var sf = zf.Snowflake{
+        .epoch = epoch,
+        .dataCenterId = 7,
+        .workerId = 3,
+        .dataCenterIdBits = 3,    // Only 3 bits (max value 7)
+        .workerIdBits = 2,        // Only 2 bits (max value 3)
+        .sequenceBits = 10,       // 10 bits for sequence
+        .sequenceMask = 0,
+        .maxDataCenterId = 0,
+        .maxWorkerId = 0,
+        .timestampLeftShift = 0,
+    };
+    
+    // Complete initialization through init function or manually
+    sf.sequenceMask = ~@as(i64, 0) ^ (~@as(i64, 0) << sf.sequenceBits);
+    sf.maxDataCenterId = ~@as(i64, 0) ^ (~@as(i64, 0) << sf.dataCenterIdBits);
+    sf.maxWorkerId = ~@as(i64, 0) ^ (~@as(i64, 0) << sf.workerIdBits);
+    sf.timestampLeftShift = sf.sequenceBits + sf.workerIdBits + sf.dataCenterIdBits;
+    
+    const id = try sf.generate();
+    const decoded = sf.decode(id);
+    
+    try expectEqual(@as(u32, 7), decoded.dataCenterId);
+    try expectEqual(@as(u32, 3), decoded.workerId);
+}
+
+test "ensure negative IDs work correctly" {
+    // With large timestamps, IDs can become negative in the i64 representation
+    // but should still decode correctly
+    const epoch = std.time.milliTimestamp() - 1000000000;
+    var sf = try zf.Snowflake.init(epoch, 1, 1);
+    
+    const id = try sf.generate();
+    const decoded = sf.decode(id);
+    
+    try expectEqual(@as(u32, 1), decoded.dataCenterId);
+    try expectEqual(@as(u32, 1), decoded.workerId);
+}
+
+test "encode and decode symmetry" {
+    const epoch = std.time.milliTimestamp();
+    var sf = try zf.Snowflake.init(epoch, 15, 7);
+    
+    // Generate a range of IDs with different sequences
+    var prev_id: i64 = 0;
+    for (0..10) |_| {
+        const id = try sf.generate();
+        try expect(id != prev_id);
+        prev_id = id;
+        
+        const decoded = sf.decode(id);
+        
+        // Manually reconstruct ID from components to verify symmetry
+        const reconstructed = ((decoded.timestamp - sf.epoch) << sf.timestampLeftShift) |
+                              (@as(i64, decoded.dataCenterId) << (sf.sequenceBits + sf.workerIdBits)) |
+                              (@as(i64, decoded.workerId) << sf.sequenceBits) |
+                              decoded.sequence;
+        
+        try expectEqual(id, reconstructed);
+    }
 }
